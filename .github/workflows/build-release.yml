@@ -7,9 +7,9 @@ on:
         description: '临时自定义包名（留空使用默认包名）'
         required: false
         default: 'com.github.lonepheasantwarrior.talkify'
-  push:
-    tags:
-      - 'v*' # 也可以在推送 Tag 时自动触发构建
+ # push:
+ #   tags:
+ #     - 'v*'
 
 jobs:
   build:
@@ -30,34 +30,37 @@ jobs:
         uses: android-actions/setup-android@v3
 
       # -------------------------------------------------------------
-      # 需求 1 & 2：在 CI 临时修改 applicationId 并仅保留 arm64-v8a
+      # 需求 1 & 2：修改包名，并修复 ABI Filters 与 splits 的冲突
       # -------------------------------------------------------------
       - name: Apply CI Modifications (Package Name & ABI Filters)
         run: |
-          # 1. 自定义包名（如果不传则使用默认值）
+          # 1. 自定义包名处理
           NEW_APP_ID="${{ github.event.inputs.custom_package_name }}"
           if [ -z "$NEW_APP_ID" ]; then
             NEW_APP_ID="com.github.lonepheasantwarrior.talkify"
           fi
           echo "Using applicationId: $NEW_APP_ID"
-          # 替换 build.gradle.kts 中的 applicationId
           sed -i -E "s/applicationId = \".*\"/applicationId = \"$NEW_APP_ID\"/" app/build.gradle.kts
 
-          # 2. 仅保留 arm64-v8a ABI，关闭 universal 包以节省构建时间和产物大小
-          echo "Configuring single ABI: arm64-v8a..."
-          sed -i -E 's/abiFilters \+= listOf\(.*\)/abiFilters += listOf("arm64-v8a")/' app/build.gradle.kts
+          # 2. 仅保留 arm64-v8a：
+          # 核心修复：注释掉 ndk 下的 abiFilters，避免与 splits.abi 冲突
+          echo "Disabling ndk.abiFilters to avoid conflict with splits..."
+          sed -i -E 's/(.*abiFilters \+=.*)/\/\/ \1/' app/build.gradle.kts
+
+          # 配置 splits 仅构建 arm64-v8a，且不构建 universal 包
+          echo "Configuring splits for arm64-v8a only..."
           sed -i -E 's/include\(.*\)/include("arm64-v8a")/' app/build.gradle.kts
           sed -i -E 's/isUniversalApk = true/isUniversalApk = false/' app/build.gradle.kts
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # 构建 Release 包（此时产出未签名的 arm64-v8a APK）
+      # 仅构建 release 变体（此时只编译并打包 arm64-v8a）
       - name: Build with Gradle
         run: ./gradlew assembleRelease --stacktrace
 
       # -------------------------------------------------------------
-      # 需求 3：CI 流程签名（使用 apksigner，无需改动 build.gradle.kts）
+      # 需求 3：CI 流程签名（使用官方 apksigner）
       # -------------------------------------------------------------
       - name: Sign APK with apksigner
         env:
@@ -66,19 +69,23 @@ jobs:
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          # 1. 还原 Keystore 文件
+          # 1. 解码还原签名证书
           echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
 
-          # 2. 定位生成的 arm64-v8a APK
+          # 2. 找到生成的未签名 arm64-v8a APK
           UNSIGNED_APK=$(find app/build/outputs/apk/release -type f -name "*arm64-v8a*.apk" | head -n 1)
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "Error: arm64-v8a APK not found!"
+            exit 1
+          fi
           echo "Found unsigned APK: $UNSIGNED_APK"
           SIGNED_APK="${UNSIGNED_APK%.apk}-signed.apk"
 
-          # 3. 获取 build-tools 中的 apksigner
+          # 3. 定位 SDK 中的 apksigner 工具
           BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
           APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
 
-          # 4. 执行 V2/V3/V4 签名
+          # 4. 执行 V2/V3 签名
           "$APKSIGNER" sign \
             --ks release.keystore \
             --ks-key-alias "$KEY_ALIAS" \
@@ -87,14 +94,14 @@ jobs:
             --out "$SIGNED_APK" \
             "$UNSIGNED_APK"
 
-          # 5. 校验签名状态
+          # 5. 验证签名完整性
           "$APKSIGNER" verify -v "$SIGNED_APK"
 
-          # 6. 删除临时 keystore 和未签名的原始 APK
+          # 6. 清理证书和中间产物
           rm -f release.keystore
           rm -f "$UNSIGNED_APK"
 
-      # 上传构建产物
+      # 上传签名后的最终 APK
       - name: Upload Signed APK
         uses: actions/upload-artifact@v4
         with:
